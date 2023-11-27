@@ -18,3 +18,4 @@ web/extensions/*
 *.log
 workflows/
 ComfyUI.code-workspace
+extra_model_paths.yaml.s13
