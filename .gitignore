@@ -19,3 +19,4 @@ web/extensions/*
 workflows/
 ComfyUI.code-workspace
 extra_model_paths.yaml.s13
+.vscode/launch.json
