@@ -3,7 +3,26 @@ import { ComfyWidgets } from "./widgets.js";
 import { ComfyUI, $el } from "./ui.js";
 import { api } from "./api.js";
 import { defaultGraph } from "./defaultGraph.js";
-import { getPngMetadata, importA1111, getLatentMetadata } from "./pnginfo.js";
+import { getPngMetadata, getWebpMetadata, importA1111, getLatentMetadata } from "./pnginfo.js";
+import { addDomClippingSetting } from "./domWidget.js";
+import { createImageHost, calculateImageGrid } from "./ui/imagePreview.js"
+
+export const ANIM_PREVIEW_WIDGET = "$$comfy_animation_preview"
+
+function sanitizeNodeName(string) {
+	let entityMap = {
+	'&': '',
+	'<': '',
+	'>': '',
+	'"': '',
+	"'": '',
+	'`': '',
+	'=': ''
+	};
+	return String(string).replace(/[&<>"'`=]/g, function fromEntityMap (s) {
+		return entityMap[s];
+	});
+}
 
 /**
  * @typedef {import("types/comfy").ComfyExtension} ComfyExtension
@@ -389,7 +408,9 @@ export class ComfyApp {
 			return shiftY;
 		}
 
-		node.prototype.setSizeForImage = function () {
+		node.prototype.setSizeForImage = function (force) {
+			if(!force && this.animatedImages) return;
+
 			if (this.inputHeight) {
 				this.setSize(this.size);
 				return;
@@ -406,13 +427,20 @@ export class ComfyApp {
 				let imagesChanged = false
 
 				const output = app.nodeOutputs[this.id + ""];
-				if (output && output.images) {
+				if (output?.images) {
+					this.animatedImages = output?.animated?.find(Boolean);
 					if (this.images !== output.images) {
 						this.images = output.images;
 						imagesChanged = true;
-						imgURLs = imgURLs.concat(output.images.map(params => {
-							return api.apiURL("/view?" + new URLSearchParams(params).toString() + app.getPreviewFormatParam());
-						}))
+						imgURLs = imgURLs.concat(
+							output.images.map((params) => {
+								return api.apiURL(
+									"/view?" +
+										new URLSearchParams(params).toString() +
+										(this.animatedImages ? "" : app.getPreviewFormatParam())
+								);
+							})
+						);
 					}
 				}
 
@@ -450,8 +478,77 @@ export class ComfyApp {
 					}
 				}
 
-				if (this.imgs && this.imgs.length) {
-					const canvas = graph.list_of_graphcanvas[0];
+				function calculateGrid(w, h, n) {
+					let columns, rows, cellsize;
+
+					if (w > h) {
+						cellsize = h;
+						columns = Math.ceil(w / cellsize);
+						rows = Math.ceil(n / columns);
+					} else {
+						cellsize = w;
+						rows = Math.ceil(h / cellsize);
+						columns = Math.ceil(n / rows);
+					}
+
+					while (columns * rows < n) {
+						cellsize++;
+						if (w >= h) {
+							columns = Math.ceil(w / cellsize);
+							rows = Math.ceil(n / columns);
+						} else {
+							rows = Math.ceil(h / cellsize);
+							columns = Math.ceil(n / rows);
+						}
+					}
+
+					const cell_size = Math.min(w/columns, h/rows);
+					return {cell_size, columns, rows};
+				}
+
+				function is_all_same_aspect_ratio(imgs) {
+					// assume: imgs.length >= 2
+					let ratio = imgs[0].naturalWidth/imgs[0].naturalHeight;
+
+					for(let i=1; i<imgs.length; i++) {
+						let this_ratio = imgs[i].naturalWidth/imgs[i].naturalHeight;
+						if(ratio != this_ratio)
+							return false;
+					}
+
+					return true;
+				}
+
+				if (this.imgs?.length) {
+					const widgetIdx = this.widgets?.findIndex((w) => w.name === ANIM_PREVIEW_WIDGET);
+				
+					if(this.animatedImages) {
+						// Instead of using the canvas we'll use a IMG
+						if(widgetIdx > -1) {
+							// Replace content
+							const widget = this.widgets[widgetIdx];
+							widget.options.host.updateImages(this.imgs);
+						} else {
+							const host = createImageHost(this);
+							this.setSizeForImage(true);
+							const widget = this.addDOMWidget(ANIM_PREVIEW_WIDGET, "img", host.el, {
+								host,
+								getHeight: host.getHeight,
+								onDraw: host.onDraw,
+								hideOnZoom: false
+							});
+							widget.serializeValue = () => undefined;
+							widget.options.host.updateImages(this.imgs);
+						}
+						return;
+					}
+
+					if (widgetIdx > -1) {
+						this.widgets[widgetIdx].onRemove?.();
+						this.widgets.splice(widgetIdx, 1);
+					}
+
+					const canvas = app.graph.list_of_graphcanvas[0];
 					const mouse = canvas.graph_mouse;
 					if (!canvas.pointer_is_down && this.pointerDown) {
 						if (mouse[0] === this.pointerDown.pos[0] && mouse[1] === this.pointerDown.pos[1]) {
@@ -460,45 +557,37 @@ export class ComfyApp {
 						this.pointerDown = null;
 					}
 
-					let w = this.imgs[0].naturalWidth;
-					let h = this.imgs[0].naturalHeight;
 					let imageIndex = this.imageIndex;
 					const numImages = this.imgs.length;
 					if (numImages === 1 && !imageIndex) {
 						this.imageIndex = imageIndex = 0;
 					}
 
-					const shiftY = getImageTop(this);
+					const top = getImageTop(this);
+					var shiftY = top;
 
 					let dw = this.size[0];
 					let dh = this.size[1];
 					dh -= shiftY;
 
 					if (imageIndex == null) {
-						let best = 0;
-						let cellWidth;
-						let cellHeight;
-						let cols = 0;
-						let shiftX = 0;
-						for (let c = 1; c <= numImages; c++) {
-							const rows = Math.ceil(numImages / c);
-							const cW = dw / c;
-							const cH = dh / rows;
-							const scaleX = cW / w;
-							const scaleY = cH / h;
+						var cellWidth, cellHeight, shiftX, cell_padding, cols;
 
-							const scale = Math.min(scaleX, scaleY, 1);
-							const imageW = w * scale;
-							const imageH = h * scale;
-							const area = imageW * imageH * numImages;
+						const compact_mode = is_all_same_aspect_ratio(this.imgs);
+						if(!compact_mode) {
+							// use rectangle cell style and border line
+							cell_padding = 2;
+							const { cell_size, columns, rows } = calculateGrid(dw, dh, numImages);
+							cols = columns;
 
-							if (area > best) {
-								best = area;
-								cellWidth = imageW;
-								cellHeight = imageH;
-								cols = c;
-								shiftX = c * ((cW - imageW) / 2);
-							}
+							cellWidth = cell_size;
+							cellHeight = cell_size;
+							shiftX = (dw-cell_size*cols)/2;
+							shiftY = (dh-cell_size*rows)/2 + top;
+						}
+						else {
+							cell_padding = 0;
+							({ cellWidth, cellHeight, cols, shiftX } = calculateImageGrid(this.imgs, dw, dh));
 						}
 
 						let anyHovered = false;
@@ -532,7 +621,24 @@ export class ComfyApp {
 								}
 							}
 							this.imageRects.push([x, y, cellWidth, cellHeight]);
-							ctx.drawImage(img, x, y, cellWidth, cellHeight);
+
+							let wratio = cellWidth/img.width;
+							let hratio = cellHeight/img.height;
+							var ratio = Math.min(wratio, hratio);
+
+							let imgHeight = ratio * img.height;
+							let imgY = row * cellHeight + shiftY + (cellHeight - imgHeight)/2;
+							let imgWidth = ratio * img.width;
+							let imgX = col * cellWidth + shiftX + (cellWidth - imgWidth)/2;
+
+							ctx.drawImage(img, imgX+cell_padding, imgY+cell_padding, imgWidth-cell_padding*2, imgHeight-cell_padding*2);
+							if(!compact_mode) {
+								// rectangle cell and border line style
+								ctx.strokeStyle = "#8F8F8F";
+								ctx.lineWidth = 1;
+								ctx.strokeRect(x+cell_padding, y+cell_padding, cellWidth-cell_padding*2, cellHeight-cell_padding*2);
+							}
+
 							ctx.filter = "none";
 						}
 
@@ -542,6 +648,9 @@ export class ComfyApp {
 						}
 					} else {
 						// Draw individual
+						let w = this.imgs[imageIndex].naturalWidth;
+						let h = this.imgs[imageIndex].naturalHeight;
+
 						const scaleX = dw / w;
 						const scaleY = dh / h;
 						const scale = Math.min(scaleX, scaleY, 1);
@@ -584,14 +693,14 @@ export class ComfyApp {
 						};
 
 						if (numImages > 1) {
-							if (drawButton(x + w - 35, y + h - 35, 30, `${this.imageIndex + 1}/${numImages}`)) {
+							if (drawButton(dw - 40, dh + top - 40, 30, `${this.imageIndex + 1}/${numImages}`)) {
 								let i = this.imageIndex + 1 >= numImages ? 0 : this.imageIndex + 1;
 								if (!this.pointerDown || !this.pointerDown.index === i) {
 									this.pointerDown = { index: i, pos: [...mouse] };
 								}
 							}
 
-							if (drawButton(x + w - 35, y + 5, 30, `x`)) {
+							if (drawButton(dw - 40, top + 10, 30, `x`)) {
 								if (!this.pointerDown || !this.pointerDown.index === null) {
 									this.pointerDown = { index: null, pos: [...mouse] };
 								}
@@ -667,11 +776,44 @@ export class ComfyApp {
 	}
 
 	/**
-	 * Adds a handler on paste that extracts and loads workflows from pasted JSON data
+	 * Adds a handler on paste that extracts and loads images or workflows from pasted JSON data
 	 */
 	#addPasteHandler() {
 		document.addEventListener("paste", (e) => {
-			let data = (e.clipboardData || window.clipboardData).getData("text/plain");
+			// ctrl+shift+v is used to paste nodes with connections
+			// this is handled by litegraph
+			if(this.shiftDown) return;
+
+			let data = (e.clipboardData || window.clipboardData);
+			const items = data.items;
+
+			// Look for image paste data
+			for (const item of items) {
+				if (item.type.startsWith('image/')) {
+					var imageNode = null;
+
+					// If an image node is selected, paste into it
+					if (this.canvas.current_node &&
+						this.canvas.current_node.is_selected &&
+						ComfyApp.isImageNode(this.canvas.current_node)) {
+						imageNode = this.canvas.current_node;
+					}
+
+					// No image node selected: add a new one
+					if (!imageNode) {
+						const newNode = LiteGraph.createNode("LoadImage");
+						newNode.pos = [...this.canvas.graph_mouse];
+						imageNode = this.graph.add(newNode);
+						this.graph.change();
+					}
+					const blob = item.getAsFile();
+					imageNode.pasteFile(blob);
+					return;
+				}
+			}
+
+			// No image found. Look for node data
+			data = data.getData("text/plain");
 			let workflow;
 			try {
 				data = data.slice(data.indexOf("{"));
@@ -687,8 +829,41 @@ export class ComfyApp {
 			if (workflow && workflow.version && workflow.nodes && workflow.extra) {
 				this.loadGraphData(workflow);
 			}
+			else {
+				if (e.target.type === "text" || e.target.type === "textarea") {
+					return;
+				}
+
+				// Litegraph default paste
+				this.canvas.pasteFromClipboard();
+			}
+
+
 		});
 	}
+
+
+	/**
+	 * Adds a handler on copy that serializes selected nodes to JSON
+	 */
+	#addCopyHandler() {
+		document.addEventListener("copy", (e) => {
+			if (e.target.type === "text" || e.target.type === "textarea") {
+				// Default system copy
+				return;
+			}
+
+			// copy nodes and clear clipboard
+			if (e.target.className === "litegraph" && this.canvas.selected_nodes) {
+				this.canvas.copyToClipboard();
+				e.clipboardData.setData('text', ' '); //clearData doesn't remove images from clipboard
+				e.preventDefault();
+				e.stopImmediatePropagation();
+				return false;
+			}
+		});
+	}
+
 
 	/**
 	 * Handle mouse
@@ -745,12 +920,6 @@ export class ComfyApp {
 		const self = this;
 		const origProcessKey = LGraphCanvas.prototype.processKey;
 		LGraphCanvas.prototype.processKey = function(e) {
-			const res = origProcessKey.apply(this, arguments);
-
-			if (res === false) {
-				return res;
-			}
-
 			if (!this.graph) {
 				return;
 			}
@@ -761,9 +930,10 @@ export class ComfyApp {
 				return;
 			}
 
-			if (e.type == "keydown") {
+			if (e.type == "keydown" && !e.repeat) {
+
 				// Ctrl + M mute/unmute
-				if (e.keyCode == 77 && e.ctrlKey) {
+				if (e.key === 'm' && e.ctrlKey) {
 					if (this.selected_nodes) {
 						for (var i in this.selected_nodes) {
 							if (this.selected_nodes[i].mode === 2) { // never
@@ -776,7 +946,8 @@ export class ComfyApp {
 					block_default = true;
 				}
 
-				if (e.keyCode == 66 && e.ctrlKey) {
+				// Ctrl + B bypass
+				if (e.key === 'b' && e.ctrlKey) {
 					if (this.selected_nodes) {
 						for (var i in this.selected_nodes) {
 							if (this.selected_nodes[i].mode === 4) { // never
@@ -788,6 +959,28 @@ export class ComfyApp {
 					}
 					block_default = true;
 				}
+
+				// Alt + C collapse/uncollapse
+				if (e.key === 'c' && e.altKey) {
+					if (this.selected_nodes) {
+						for (var i in this.selected_nodes) {
+							this.selected_nodes[i].collapse()
+						}
+					}
+					block_default = true;
+				}
+
+				// Ctrl+C Copy
+				if ((e.key === 'c') && (e.metaKey || e.ctrlKey)) {
+					// Trigger onCopy
+					return true;
+				}
+
+				// Ctrl+V Paste
+				if ((e.key === 'v' || e.key == 'V') && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
+					// Trigger onPaste
+					return true;
+				}
 			}
 
 			this.graph.change();
@@ -798,7 +991,8 @@ export class ComfyApp {
 				return false;
 			}
 
-			return res;
+			// Fall through to Litegraph defaults
+			return origProcessKey.apply(this, arguments);
 		};
 	}
 
@@ -994,6 +1188,10 @@ export class ComfyApp {
 		api.addEventListener("execution_start", ({ detail }) => {
 			this.runningNodeId = null;
 			this.lastExecutionError = null
+			this.graph._nodes.forEach((node) => {
+				if (node.onExecutionStart)
+					node.onExecutionStart()
+			})
 		});
 
 		api.addEventListener("execution_error", ({ detail }) => {
@@ -1023,6 +1221,40 @@ export class ComfyApp {
 		window.addEventListener("keyup", (e) => {
 			this.shiftDown = e.shiftKey;
 		});
+	}
+
+	#addConfigureHandler() {
+		const app = this;
+		const configure = LGraph.prototype.configure;
+		// Flag that the graph is configuring to prevent nodes from running checks while its still loading
+		LGraph.prototype.configure = function () {
+			app.configuringGraph = true;
+			try {
+				return configure.apply(this, arguments);
+			} finally {
+				app.configuringGraph = false;
+			}
+		};
+	}
+
+	#addAfterConfigureHandler() {
+		const app = this;
+		const onConfigure = app.graph.onConfigure;
+		app.graph.onConfigure = function () {
+			// Fire callbacks before the onConfigure, this is used by widget inputs to setup the config
+			for (const node of app.graph._nodes) {
+				node.onGraphConfigured?.();
+			}
+			
+			const r = onConfigure?.apply(this, arguments);
+			
+			// Fire after onConfigure, used by primitves to generate widget using input nodes config
+			for (const node of app.graph._nodes) {
+				node.onAfterGraphConfigured?.();
+			}
+
+			return r;
+		};
 	}
 
 	/**
@@ -1056,10 +1288,15 @@ export class ComfyApp {
 		canvasEl.tabIndex = "1";
 		document.body.prepend(canvasEl);
 
+		addDomClippingSetting();
 		this.#addProcessMouseHandler();
 		this.#addProcessKeyHandler();
+		this.#addConfigureHandler();
 
 		this.graph = new LGraph();
+
+		this.#addAfterConfigureHandler();
+
 		const canvas = (this.canvas = new LGraphCanvas(canvasEl, this.graph));
 		this.ctx = canvasEl.getContext("2d");
 
@@ -1110,6 +1347,7 @@ export class ComfyApp {
 		this.#addDrawGroupsHandler();
 		this.#addApiUpdateHandlers();
 		this.#addDropHandler();
+		this.#addCopyHandler();
 		this.#addPasteHandler();
 		this.#addKeyboardHandler();
 
@@ -1151,27 +1389,35 @@ export class ComfyApp {
 						const inputData = inputs[inputName];
 						const type = inputData[0];
 
-						if(inputData[1]?.forceInput) {
-							this.addInput(inputName, type);
+						let widgetCreated = true;
+						if (Array.isArray(type)) {
+							// Enums
+							Object.assign(config, widgets.COMBO(this, inputName, inputData, app) || {});
+						} else if (`${type}:${inputName}` in widgets) {
+							// Support custom widgets by Type:Name
+							Object.assign(config, widgets[`${type}:${inputName}`](this, inputName, inputData, app) || {});
+						} else if (type in widgets) {
+							// Standard type widgets
+							Object.assign(config, widgets[type](this, inputName, inputData, app) || {});
 						} else {
-							if (Array.isArray(type)) {
-								// Enums
-								Object.assign(config, widgets.COMBO(this, inputName, inputData, app) || {});
-							} else if (`${type}:${inputName}` in widgets) {
-								// Support custom widgets by Type:Name
-								Object.assign(config, widgets[`${type}:${inputName}`](this, inputName, inputData, app) || {});
-							} else if (type in widgets) {
-								// Standard type widgets
-								Object.assign(config, widgets[type](this, inputName, inputData, app) || {});
-							} else {
-								// Node connection inputs
-								this.addInput(inputName, type);
-							}
+							// Node connection inputs
+							this.addInput(inputName, type);
+							widgetCreated = false;
+						}
+
+						if(widgetCreated && inputData[1]?.forceInput && config?.widget) {
+							if (!config.widget.options) config.widget.options = {};
+							config.widget.options.forceInput = inputData[1].forceInput;
+						}
+						if(widgetCreated && inputData[1]?.defaultInput && config?.widget) {
+							if (!config.widget.options) config.widget.options = {};
+							config.widget.options.defaultInput = inputData[1].defaultInput;
 						}
 					}
 
 					for (const o in nodeData["output"]) {
-						const output = nodeData["output"][o];
+						let output = nodeData["output"][o];
+						if(output instanceof Array) output = "COMBO";
 						const outputName = nodeData["output_name"][o] || output;
 						const outputShape = nodeData["output_is_list"][o] ? LiteGraph.GRID_SHAPE : LiteGraph.CIRCLE_SHAPE ;
 						this.addOutput(outputName, output, { shape: outputShape });
@@ -1188,6 +1434,7 @@ export class ComfyApp {
 				{
 					title: nodeData.display_name || nodeData.name,
 					comfyClass: nodeData.name,
+					nodeData
 				}
 			);
 			node.prototype.comfyClass = nodeData.name;
@@ -1202,6 +1449,54 @@ export class ComfyApp {
 		}
 	}
 
+	loadTemplateData(templateData) {
+		if (!templateData?.templates) {
+			return;
+		}
+
+		const old = localStorage.getItem("litegrapheditor_clipboard");
+
+		var maxY, nodeBottom, node;
+
+		for (const template of templateData.templates) {
+			if (!template?.data) {
+				continue;
+			}
+
+			localStorage.setItem("litegrapheditor_clipboard", template.data);
+			app.canvas.pasteFromClipboard();
+
+			// Move mouse position down to paste the next template below
+
+			maxY = false;
+
+			for (const i in app.canvas.selected_nodes) {
+				node = app.canvas.selected_nodes[i];
+
+				nodeBottom = node.pos[1] + node.size[1];
+
+				if (maxY === false || nodeBottom > maxY) {
+					maxY = nodeBottom;
+				}
+			}
+
+			app.canvas.graph_mouse[1] = maxY + 50;
+		}
+
+		localStorage.setItem("litegrapheditor_clipboard", old);
+	}
+
+	showMissingNodesError(missingNodeTypes, hasAddedNodes = true) {
+		this.ui.dialog.show(
+			`When loading the graph, the following node types were not found: <ul>${Array.from(new Set(missingNodeTypes)).map(
+				(t) => `<li>${t}</li>`
+			).join("")}</ul>${hasAddedNodes ? "Nodes that have failed to load will show as red on the graph." : ""}`
+		);
+		this.logging.addEntry("Comfy.App", "warn", {
+			MissingNodes: missingNodeTypes,
+		});
+	}
+
 	/**
 	 * Populates the graph with the specified workflow data
 	 * @param {*} graphData A serialized graph object
@@ -1211,17 +1506,28 @@ export class ComfyApp {
 
 		let reset_invalid_values = false;
 		if (!graphData) {
-			graphData = structuredClone(defaultGraph);
+			graphData = defaultGraph;
 			reset_invalid_values = true;
+		}
+
+		if (typeof structuredClone === "undefined")
+		{
+			graphData = JSON.parse(JSON.stringify(graphData));
+		}else
+		{
+			graphData = structuredClone(graphData);
 		}
 
 		const missingNodeTypes = [];
 		for (let n of graphData.nodes) {
 			// Patch T2IAdapterLoader to ControlNetLoader since they are the same node now
 			if (n.type == "T2IAdapterLoader") n.type = "ControlNetLoader";
+			if (n.type == "ConditioningAverage ") n.type = "ConditioningAverage"; //typo fix
+			if (n.type == "SDV_img2vid_Conditioning") n.type = "SVD_img2vid_Conditioning"; //typo fix
 
 			// Find missing node types
 			if (!(n.type in LiteGraph.registered_node_types)) {
+				n.type = sanitizeNodeName(n.type);
 				missingNodeTypes.push(n.type);
 			}
 		}
@@ -1312,14 +1618,7 @@ export class ComfyApp {
 		}
 
 		if (missingNodeTypes.length) {
-			this.ui.dialog.show(
-				`When loading the graph, the following node types were not found: <ul>${Array.from(new Set(missingNodeTypes)).map(
-					(t) => `<li>${t}</li>`
-				).join("")}</ul>Nodes that have failed to load will show as red on the graph.`
-			);
-			this.logging.addEntry("Comfy.App", "warn", {
-				MissingNodes: missingNodeTypes,
-			});
+			this.showMissingNodesError(missingNodeTypes);
 		}
 	}
 
@@ -1328,6 +1627,16 @@ export class ComfyApp {
 	 * @returns The workflow and node links
 	 */
 	async graphToPrompt() {
+		for (const node of this.graph.computeExecutionOrder(false)) {
+			if (node.isVirtualNode) {
+				// Don't serialize frontend only nodes but let them make changes
+				if (node.applyToGraph) {
+					node.applyToGraph();
+				}
+				continue;
+			}
+		}
+
 		const workflow = this.graph.serialize();
 		const output = {};
 		// Process nodes in order of execution
@@ -1335,10 +1644,6 @@ export class ComfyApp {
 			const n = workflow.nodes.find((n) => n.id === node.id);
 
 			if (node.isVirtualNode) {
-				// Don't serialize frontend only nodes but let them make changes
-				if (node.applyToGraph) {
-					node.applyToGraph(workflow);
-				}
 				continue;
 			}
 
@@ -1381,7 +1686,7 @@ export class ComfyApp {
 								all_inputs = all_inputs.concat(Object.keys(parent.inputs))
 								for (let parent_input in all_inputs) {
 									parent_input = all_inputs[parent_input];
-									if (parent.inputs[parent_input].type === node.inputs[i].type) {
+									if (parent.inputs[parent_input]?.type === node.inputs[i].type) {
 										link = parent.getInputLink(parent_input);
 										if (link) {
 											parent = parent.getInputNode(parent_input);
@@ -1532,10 +1837,26 @@ export class ComfyApp {
 					importA1111(this.graph, pngInfo.parameters);
 				}
 			}
+		} else if (file.type === "image/webp") {
+			const pngInfo = await getWebpMetadata(file);
+			if (pngInfo) {
+				if (pngInfo.workflow) {
+					this.loadGraphData(JSON.parse(pngInfo.workflow));
+				} else if (pngInfo.Workflow) {
+					this.loadGraphData(JSON.parse(pngInfo.Workflow)); // Support loading workflows from that webp custom node.
+				}
+			}
 		} else if (file.type === "application/json" || file.name?.endsWith(".json")) {
 			const reader = new FileReader();
 			reader.onload = () => {
-				this.loadGraphData(JSON.parse(reader.result));
+				const jsonContent = JSON.parse(reader.result);
+				if (jsonContent?.templates) {
+					this.loadTemplateData(jsonContent);
+				} else if(this.isApiJson(jsonContent)) {
+					this.loadApiJson(jsonContent);
+				} else {
+					this.loadGraphData(jsonContent);
+				}
 			};
 			reader.readAsText(file);
 		} else if (file.name?.endsWith(".latent") || file.name?.endsWith(".safetensors")) {
@@ -1544,6 +1865,51 @@ export class ComfyApp {
 				this.loadGraphData(JSON.parse(info.workflow));
 			}
 		}
+	}
+
+	isApiJson(data) {
+		return Object.values(data).every((v) => v.class_type);
+	}
+
+	loadApiJson(apiData) {
+		const missingNodeTypes = Object.values(apiData).filter((n) => !LiteGraph.registered_node_types[n.class_type]);
+		if (missingNodeTypes.length) {
+			this.showMissingNodesError(missingNodeTypes.map(t => t.class_type), false);
+			return;
+		}
+
+		const ids = Object.keys(apiData);
+		app.graph.clear();
+		for (const id of ids) {
+			const data = apiData[id];
+			const node = LiteGraph.createNode(data.class_type);
+			node.id = isNaN(+id) ? id : +id;
+			graph.add(node);
+		}
+
+		for (const id of ids) {
+			const data = apiData[id];
+			const node = app.graph.getNodeById(id);
+			for (const input in data.inputs ?? {}) {
+				const value = data.inputs[input];
+				if (value instanceof Array) {
+					const [fromId, fromSlot] = value;
+					const fromNode = app.graph.getNodeById(fromId);
+					const toSlot = node.inputs?.findIndex((inp) => inp.name === input);
+					if (toSlot !== -1) {
+						fromNode.connect(fromSlot, node, toSlot);
+					}
+				} else {
+					const widget = node.widgets?.find((w) => w.name === input);
+					if (widget) {
+						widget.value = value;
+						widget.callback?.(value);
+					}
+				}
+			}
+		}
+
+		app.graph.arrange();
 	}
 
 	/**
@@ -1566,13 +1932,21 @@ export class ComfyApp {
 	async refreshComboInNodes() {
 		const defs = await api.getNodeDefs();
 
+		for(const nodeId in LiteGraph.registered_node_types) {
+			const node = LiteGraph.registered_node_types[nodeId];
+			const nodeDef = defs[nodeId];
+			if(!nodeDef) continue;
+
+			node.nodeData = nodeDef;
+		}
+
 		for(let nodeNum in this.graph._nodes) {
 			const node = this.graph._nodes[nodeNum];
-
 			const def = defs[node.type];
 
-			// HOTFIX: The current patch is designed to prevent the rest of the code from breaking due to primitive nodes,
-			//         and additional work is needed to consider the primitive logic in the refresh logic.
+			// Allow primitive nodes to handle refresh
+			node.refreshComboInNode?.(defs);
+
 			if(!def)
 				continue;
 

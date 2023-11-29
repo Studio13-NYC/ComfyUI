@@ -88,7 +88,7 @@ body {
 	top: 50%;
 	right: 0;
 	text-align: center;
-	z-index: 100;
+	z-index: 999;
 	width: 170px;
 	display: flex;
 	flex-direction: column;
@@ -407,6 +407,21 @@ dialog::backdrop {
 	border: 1px solid #999;
 	margin: 0 0 5px 5px;
 	width: calc(100% - 10px);
+}
+
+.comfy-img-preview {
+	pointer-events: none;
+	overflow: hidden;
+	display: flex;
+	flex-wrap: wrap;
+ 	align-content: flex-start;
+	justify-content: center;
+}
+
+.comfy-img-preview img {
+	object-fit: contain;
+	width: var(--comfy-img-preview-width);
+	height: var(--comfy-img-preview-height);
 }
 
 /* Search box */

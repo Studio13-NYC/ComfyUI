@@ -1,3 +1,6 @@
+import comfy.options
+comfy.options.enable_args_parsing()
+
 import os
 import importlib.util
 import folder_paths
@@ -85,6 +88,7 @@ def cuda_malloc_warning():
 
 def prompt_worker(q, server):
     e = execution.PromptExecutor(server)
+    last_gc_collect = 0
     while True:
         item, item_id = q.get()
         execution_start_time = time.perf_counter()
@@ -94,9 +98,14 @@ def prompt_worker(q, server):
         if server.client_id is not None:
             server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, server.client_id)
 
-        print("Prompt executed in {:.2f} seconds".format(time.perf_counter() - execution_start_time))
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+        current_time = time.perf_counter()
+        execution_time = current_time - execution_start_time
+        print("Prompt executed in {:.2f} seconds".format(execution_time))
+        if (current_time - last_gc_collect) > 10.0:
+            gc.collect()
+            comfy.model_management.soft_empty_cache()
+            last_gc_collect = current_time
+            print("gc collect")
 
 async def run(server, address='', port=8188, verbose=True, call_on_start=None):
     await asyncio.gather(server.start(address, port, verbose, call_on_start), server.publish_loop())
@@ -104,6 +113,7 @@ async def run(server, address='', port=8188, verbose=True, call_on_start=None):
 
 def hijack_progress(server):
     def hook(value, total, preview_image):
+        comfy.model_management.throw_exception_if_processing_interrupted()
         server.send_sync("progress", {"value": value, "max": total}, server.client_id)
         if preview_image is not None:
             server.send_sync(BinaryEventTypes.UNENCODED_PREVIEW_IMAGE, preview_image, server.client_id)
@@ -170,6 +180,16 @@ if __name__ == "__main__":
         output_dir = os.path.abspath(args.output_directory)
         print(f"Setting output directory to: {output_dir}")
         folder_paths.set_output_directory(output_dir)
+
+    #These are the default folders that checkpoints, clip and vae models will be saved to when using CheckpointSave, etc.. nodes
+    folder_paths.add_model_folder_path("checkpoints", os.path.join(folder_paths.get_output_directory(), "checkpoints"))
+    folder_paths.add_model_folder_path("clip", os.path.join(folder_paths.get_output_directory(), "clip"))
+    folder_paths.add_model_folder_path("vae", os.path.join(folder_paths.get_output_directory(), "vae"))
+
+    if args.input_directory:
+        input_dir = os.path.abspath(args.input_directory)
+        print(f"Setting input directory to: {input_dir}")
+        folder_paths.set_input_directory(input_dir)
 
     if args.quick_test_for_ci:
         exit(0)
