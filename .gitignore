@@ -17,3 +17,4 @@ web/extensions/*
 /.venv/
 *.log
 /workflows/
+
